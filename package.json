@@ -6,7 +6,7 @@
     "build": "npm run build:gba-worker && npm run build:snes-worker && npm run copy-assets",
     "build:gba-worker": "esbuild src/gba/worker.ts --bundle --format=esm --target=es2022 --outfile=dist/gba_worker.js",
     "build:snes-worker": "esbuild src/snes/worker.ts --bundle --format=esm --target=es2022 --outfile=dist/snes_worker.js --external:/byuu-web-lib.js",
-    "copy-assets": "cp demo/index.html dist/index.html",
+    "copy-assets": "cp docs/index.html dist/index.html",
     "patch": "cd vendor/mgba && git apply ../../patches/mgba.patch && cd ../byuu-web && git apply ../../patches/byuu-web.patch",
     "rebuild-mgba": "docker run --rm -t --platform linux/arm64 -v $PWD/vendor/mgba:/home/mgba/src mgba/wasm:arm64 && cp vendor/mgba/build-wasm/wasm/mgba.wasm dist/mgba.wasm && cp vendor/mgba/build-wasm/wasm/mgba.js dist/mgba.js",
     "rebuild-byuu": "EMSDK=$PWD/vendor/emsdk PATH=$PWD/vendor/emsdk/upstream/emscripten:$PWD/vendor/emsdk/upstream/bin:$PATH rm -f vendor/byuu-web/higan/obj/sfc-ppu.o vendor/byuu-web/higan/obj/mplay-extras.o 2>/dev/null; (cd vendor/byuu-web/higan && PATH=$PWD/../../../vendor/emsdk/upstream/emscripten:$PWD/../../../vendor/emsdk/upstream/bin:$PATH make target=web platform=web package -j4) && cp vendor/byuu-web/higan/out/package/byuu-web-lib.js dist/byuu-web-lib.js && cp vendor/byuu-web/higan/out/package/byuu-web-lib.wasm dist/byuu-web-lib.wasm",
