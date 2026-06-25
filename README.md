@@ -1,5 +1,7 @@
 # netro-emu
 
+[**Live demo**](https://dans-stuff.github.io/netro/)
+
 Browser-based GBA and SNES emulators running as Web Workers with an extended API for multiplayer ghost rendering. Each emulator runs in an isolated Worker context, communicating with the host via `postMessage`.
 
 Built on [mGBA](https://github.com/thenick775/mgba) (MPL-2.0) and [byuu-web/bsnes](https://github.com/Wizcorp/byuu-web) (GPL-3), with patches that expose PPU internals for sprite injection.
