@@ -1,0 +1,699 @@
+--- a/src/platform/wasm/memory.c	2026-06-24 19:46:01
++++ b/src/platform/wasm/memory.c	2026-05-27 12:46:09
+@@ -4,6 +4,13 @@
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ #include <mgba-util/memory.h>
++#include <mgba/core/core.h>
++#include <mgba/internal/gba/gba.h>      // PATCHED: for `struct GBA` (core->board cast)
++#include <mgba/internal/gba/video.h>    // PATCHED: for the OAM union
++#include <emscripten.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
+ 
+ #include <malloc.h>
+ 
+@@ -15,3 +22,489 @@
+ 	UNUSED(size);
+ 	free(memory);
+ }
++
++/* ---- PATCHED: emulated-bus memory access for the multiplayer overlay -------
++ *
++ * Exposes the active mCore's busRead/busWrite as EMSCRIPTEN_KEEPALIVE'd
++ * functions so JS can `cwrap` them and read/write the emulated GBA's EWRAM /
++ * IWRAM / OAM at arbitrary addresses every frame. Used by the multiplayer
++ * ghost-rendering adapters (firered.ts, emerald.ts) to extract player coords
++ * and inject peer OAM entries into the engine's shadow OAM buffer.
++ *
++ * Safe to call between frames -- which is what we do (from the JS
++ * videoFrameStartedCallback). Callers must NOT call these while the emu
++ * thread is mid-frame.
++ *
++ * The `renderer` symbol is defined in main.c. We declare an opaque shim
++ * (`wasm_get_core`) implemented there to avoid pulling main.h into here.
++ */
++
++struct mCore* wasm_get_core(void);
++
++EMSCRIPTEN_KEEPALIVE uint8_t wasm_read_u8(uint32_t addr) {
++	struct mCore* c = wasm_get_core();
++	if (!c) return 0;
++	return (uint8_t)c->busRead8(c, addr);
++}
++EMSCRIPTEN_KEEPALIVE uint16_t wasm_read_u16(uint32_t addr) {
++	struct mCore* c = wasm_get_core();
++	if (!c) return 0;
++	return (uint16_t)c->busRead16(c, addr);
++}
++EMSCRIPTEN_KEEPALIVE uint32_t wasm_read_u32(uint32_t addr) {
++	struct mCore* c = wasm_get_core();
++	if (!c) return 0;
++	return c->busRead32(c, addr);
++}
++EMSCRIPTEN_KEEPALIVE void wasm_write_u8(uint32_t addr, uint8_t value) {
++	struct mCore* c = wasm_get_core();
++	if (c) c->busWrite8(c, addr, value);
++}
++EMSCRIPTEN_KEEPALIVE void wasm_write_u16(uint32_t addr, uint16_t value) {
++	struct mCore* c = wasm_get_core();
++	if (c) c->busWrite16(c, addr, value);
++}
++EMSCRIPTEN_KEEPALIVE void wasm_write_u32(uint32_t addr, uint32_t value) {
++	struct mCore* c = wasm_get_core();
++	if (c) c->busWrite32(c, addr, value);
++}
++
++/* Bulk read into a heap buffer allocated by JS (Module._malloc). Cheaper than
++ * a loop of wasm_read_u8 when the adapter wants OAM (1KB) or a chunk of EWRAM.
++ * Caller passes the destination pointer (from Module._malloc) and length;
++ * we copy bytes byte-at-a-time through busRead8 (handles all memory regions
++ * including OAM/VRAM correctly). */
++EMSCRIPTEN_KEEPALIVE void wasm_read_bytes(uint32_t addr, uint8_t* dst, uint32_t len) {
++	struct mCore* c = wasm_get_core();
++	if (!c || !dst) return;
++	for (uint32_t i = 0; i < len; ++i) {
++		dst[i] = (uint8_t)c->busRead8(c, addr + i);
++	}
++}
++
++/* ---- PATCHED: runtime provenance tracking --------------------------------
++ *
++ * Tracks where bytes in IWRAM / EWRAM / OBJ VRAM / OBJ palette RAM came
++ * from in ROM. Hooks the BIOS handlers for LZ77UnComp (SWI 0x11/0x12),
++ * CpuSet (SWI 0x0B), CpuFastSet (SWI 0x0C). Granularity is 32 bytes (one
++ * 4bpp tile or one 16-color palette bank).
++ *
++ * Chained provenance: pokefirered loads sprites via LZ77 (ROM -> IWRAM
++ * workbuffer) then CpuSet (IWRAM -> VRAM). The LZ77 hook records IWRAM
++ * provenance; the CpuSet hook copies that provenance into the VRAM
++ * provenance table when its src is IWRAM/EWRAM.
++ *
++ * JS queries via wasm_get_obj_tile_provenance / wasm_get_obj_palette_provenance
++ * to find the ROM source for a peer's currently-displayed sprite, then
++ * broadcasts those offsets over the wire (no pixel bytes), and peers feed
++ * them back into wasm_set_extra_sprite.
++ */
++
++/* Fine-grained slot tracking: 4 bytes per slot.
++ *
++ * Rationale: all standard GBA copy operations (CpuCopy16, CpuFastSet, DMA)
++ * are at LEAST 4-byte aligned. Using 4-byte slots means every operation
++ * covers an integer number of slots exactly -- no "partial slot" garbage
++ * from buffers like gPlttBufferFaded that are 4-aligned but not 32-aligned.
++ *
++ * The public query API (wasm_query_obj_tile_prov / wasm_query_obj_palette_prov)
++ * aggregates 8 consecutive 4-byte slots into one 32-byte block provenance.
++ * If the 8 slots are mutually consistent (same rom_addr/blob_total/compressed
++ * and contiguous blob_offsets at 4-byte stride), we return a single coherent
++ * (rom_addr, blob_offset, blob_total, compressed). Otherwise we return zero
++ * (the block had MIXED sources and we can't reproduce it cleanly).
++ */
++
++#define PROV_SLOT_BYTES 4
++
++struct ProvSlot {
++	uint32_t rom_addr;     /* 0 if unknown */
++	uint32_t blob_offset;  /* byte offset into the post-decompression blob */
++	uint32_t blob_total;   /* total decompressed size of the blob */
++	uint8_t  compressed;
++	uint8_t  _pad[3];
++};
++
++#define PROV_EWRAM_SLOTS    (256 * 1024 / PROV_SLOT_BYTES)
++#define PROV_IWRAM_SLOTS    ( 32 * 1024 / PROV_SLOT_BYTES)
++#define PROV_OBJVRAM_SLOTS  ( 32 * 1024 / PROV_SLOT_BYTES)  /* 0x06010000..0x06017FFF */
++#define PROV_OBJPAL_SLOTS   ( 512        / PROV_SLOT_BYTES) /* 0x05000200..0x050003FF */
++
++static struct ProvSlot prov_ewram   [PROV_EWRAM_SLOTS];
++static struct ProvSlot prov_iwram   [PROV_IWRAM_SLOTS];
++static struct ProvSlot prov_objvram [PROV_OBJVRAM_SLOTS];
++static struct ProvSlot prov_objpal  [PROV_OBJPAL_SLOTS];
++
++static struct ProvSlot* prov_slot_for(uint32_t addr) {
++	uint32_t region = addr >> 24;
++	switch (region) {
++	case 0x02: {  /* EWRAM */
++		uint32_t off = (addr - 0x02000000) & 0x3FFFF;
++		return &prov_ewram[off / PROV_SLOT_BYTES];
++	}
++	case 0x03: {  /* IWRAM */
++		uint32_t off = (addr - 0x03000000) & 0x7FFF;
++		return &prov_iwram[off / PROV_SLOT_BYTES];
++	}
++	case 0x05: {  /* PALETTE: only OBJ half */
++		if (addr < 0x05000200 || addr > 0x050003FF) return 0;
++		uint32_t off = addr - 0x05000200;
++		return &prov_objpal[off / PROV_SLOT_BYTES];
++	}
++	case 0x06: {  /* VRAM: only OBJ region */
++		if (addr < 0x06010000 || addr > 0x06017FFF) return 0;
++		uint32_t off = addr - 0x06010000;
++		return &prov_objvram[off / PROV_SLOT_BYTES];
++	}
++	}
++	return 0;
++}
++
++/* Fill provenance for [dst .. dst+len). With PROV_SLOT_BYTES=4, all
++ * standard GBA copies (4-byte aligned) cover slots cleanly with no
++ * partial-slot ambiguity. dst MUST be 4-byte aligned (we down-align if
++ * not, but the caller should ensure it). */
++static void record_prov_range(uint32_t dst, uint32_t len, uint32_t rom_addr,
++                              uint32_t blob_total, uint32_t src_blob_offset,
++                              uint8_t compressed) {
++	uint32_t aligned_dst = dst & ~3u;
++	uint32_t end = dst + len;
++	for (uint32_t a = aligned_dst; a < end; a += PROV_SLOT_BYTES) {
++		struct ProvSlot* p = prov_slot_for(a);
++		if (!p) continue;
++		p->rom_addr    = rom_addr;
++		p->blob_total  = blob_total;
++		p->blob_offset = src_blob_offset + (a - aligned_dst);
++		p->compressed  = compressed;
++	}
++}
++
++/* Called from bios.c on LZ77UnCompWram/Vram (SWI 0x11/0x12). */
++void wasm_prov_record_lz77(uint32_t src_rom, uint32_t dst, uint32_t decompressed_size) {
++	if ((src_rom >> 24) < 0x08) return;  /* not from ROM, ignore */
++	record_prov_range(dst, decompressed_size, src_rom, decompressed_size, 0, 1);
++}
++
++/* Called from bios.c on CpuSet/CpuFastSet (SWI 0x0B/0x0C) -- copy mode. */
++void wasm_prov_record_cpuset(uint32_t src, uint32_t dst, uint32_t bytes) {
++	/* If src is in ROM, record directly as uncompressed. */
++	if ((src >> 24) >= 0x08 && (src >> 24) <= 0x0D) {
++		record_prov_range(dst, bytes, src, bytes, 0, 0);
++		return;
++	}
++	/* Otherwise chain through IWRAM/EWRAM provenance, slot by slot. */
++	uint32_t src_aligned = src & ~3u;
++	uint32_t dst_aligned = dst & ~3u;
++	uint32_t end = dst + bytes;
++	for (uint32_t off = 0; dst_aligned + off < end; off += PROV_SLOT_BYTES) {
++		struct ProvSlot* sp = prov_slot_for(src_aligned + off);
++		struct ProvSlot* dp = prov_slot_for(dst_aligned + off);
++		if (!dp) continue;
++		if (sp && sp->rom_addr) {
++			dp->rom_addr    = sp->rom_addr;
++			dp->blob_total  = sp->blob_total;
++			dp->blob_offset = sp->blob_offset;
++			dp->compressed  = sp->compressed;
++		}
++		/* If sp is empty, leave dp alone (sticky provenance). Clearing
++		 * dp here was a bug -- pokefirered's per-frame palette fade/blend
++		 * does small CpuCopy16's from untracked scratch buffers, which
++		 * would otherwise wipe out the good provenance LoadPalette set
++		 * at map enter. Stale prov pointing at slightly-old ROM bytes is
++		 * vastly preferable to empty prov. */
++	}
++}
++
++/* Aggregate `n` consecutive 4-byte slots starting at `slots[0]` into a
++ * single coherent provenance record. Returns 1 if the slots are mutually
++ * consistent (same rom_addr/blob_total/compressed, contiguous blob_offsets
++ * at 4-byte stride), 0 otherwise. On success, fills *out with the prov
++ * for the START of the aggregated block. */
++static int aggregate_slots(const struct ProvSlot* slots, int n, struct ProvSlot* out) {
++	if (n <= 0) return 0;
++	uint32_t rom = slots[0].rom_addr;
++	uint32_t total = slots[0].blob_total;
++	uint32_t base_offset = slots[0].blob_offset;
++	uint8_t comp = slots[0].compressed;
++	if (!rom) return 0;
++	for (int i = 1; i < n; ++i) {
++		if (slots[i].rom_addr != rom) return 0;
++		if (slots[i].blob_total != total) return 0;
++		if (slots[i].compressed != comp) return 0;
++		if (slots[i].blob_offset != base_offset + (uint32_t)i * PROV_SLOT_BYTES) return 0;
++	}
++	out->rom_addr    = rom;
++	out->blob_offset = base_offset;
++	out->blob_total  = total;
++	out->compressed  = comp;
++	return 1;
++}
++
++static struct ProvSlot prov_last_query;
++
++EMSCRIPTEN_KEEPALIVE void wasm_query_obj_tile_prov(int tile_id) {
++	prov_last_query = (struct ProvSlot){0};
++	/* Each tile is 32 bytes = 8 consecutive 4-byte slots in prov_objvram. */
++	int base = tile_id * 8;
++	if (tile_id < 0 || base + 8 > PROV_OBJVRAM_SLOTS) return;
++	aggregate_slots(&prov_objvram[base], 8, &prov_last_query);
++}
++EMSCRIPTEN_KEEPALIVE void wasm_query_obj_palette_prov(int bank) {
++	prov_last_query = (struct ProvSlot){0};
++	/* Each palette bank is 32 bytes = 8 consecutive 4-byte slots. */
++	int base = bank * 8;
++	if (bank < 0 || base + 8 > PROV_OBJPAL_SLOTS) return;
++	aggregate_slots(&prov_objpal[base], 8, &prov_last_query);
++}
++EMSCRIPTEN_KEEPALIVE uint32_t wasm_prov_rom_addr   (void) { return prov_last_query.rom_addr; }
++EMSCRIPTEN_KEEPALIVE uint32_t wasm_prov_blob_offset(void) { return prov_last_query.blob_offset; }
++EMSCRIPTEN_KEEPALIVE uint32_t wasm_prov_blob_total (void) { return prov_last_query.blob_total; }
++EMSCRIPTEN_KEEPALIVE uint32_t wasm_prov_compressed (void) { return prov_last_query.compressed; }
++
++/* ---- BG scroll shadow ----------------------------------------------------
++ * mGBA's IO read returns junk for write-only BG*OFS regs. We need the
++ * last-written value so JS can derive sub-pixel camera offset for ghost
++ * positioning during walks. Hooked from GBAIOWrite in io.c. */
++static uint16_t bg_hofs[4];
++static uint16_t bg_vofs[4];
++void wasm_record_bg_hofs(int bg, uint16_t value) { if ((unsigned)bg < 4) bg_hofs[bg] = value; }
++void wasm_record_bg_vofs(int bg, uint16_t value) { if ((unsigned)bg < 4) bg_vofs[bg] = value; }
++EMSCRIPTEN_KEEPALIVE uint32_t wasm_get_bg_hofs(int bg) { return ((unsigned)bg < 4) ? bg_hofs[bg] : 0; }
++EMSCRIPTEN_KEEPALIVE uint32_t wasm_get_bg_vofs(int bg) { return ((unsigned)bg < 4) ? bg_vofs[bg] : 0; }
++
++/* ---- PATCHED: minimal extra-sprite bridge --------------------------------
++ *
++ * One C function does everything: read tile + palette bytes from ROM,
++ * decode them into RGBA, store with screen position + priority. JS does
++ * ALL game-specific work (ROM offset lookup tables, animation state,
++ * sub-pixel positioning, etc.). The renderer hook (video-software.c)
++ * iterates these per scanline and blits decoded pixels into the line
++ * buffer at the given priority -- no GBA semantics, just pixels with
++ * z-ordering against BG layers.
++ */
++
++#define EXTRA_MAX             8
++#define EXTRA_MAX_W           32
++#define EXTRA_MAX_H           32
++#define EXTRA_PIXEL_BUF_BYTES (EXTRA_MAX_W * EXTRA_MAX_H * 2)  // RGB555 halfwords
++
++struct ExtraSprite {
++	int      active;
++	int16_t  screen_x;
++	int16_t  screen_y;
++	int      width;
++	int      height;
++	int      priority;       // 0..3, lower = on top
++	uint16_t pixels[EXTRA_MAX_W * EXTRA_MAX_H];  // RGB555; alpha-zero color = transparent
++};
++
++struct ExtraSprite extra_sprites[EXTRA_MAX];
++
++/* LZ77 decoder for GBA ROM compressed data. Header is one byte (compression
++ * type, must be 0x10) + 3 bytes little-endian decompressed size. */
++static void lz77_decode(struct mCore* c, uint32_t src, uint8_t* dst, uint32_t out_len) {
++	uint32_t header = c->busRead32(c, src); src += 4;
++	uint32_t total_size = (header >> 8) & 0x00FFFFFF;
++	if (total_size > out_len) total_size = out_len;
++	uint32_t written = 0;
++	while (written < total_size) {
++		uint8_t flags = (uint8_t) c->busRead8(c, src++);
++		for (int b = 0; b < 8 && written < total_size; ++b) {
++			if (flags & 0x80) {
++				uint8_t hi = (uint8_t) c->busRead8(c, src++);
++				uint8_t lo = (uint8_t) c->busRead8(c, src++);
++				int length = (hi >> 4) + 3;
++				int dist   = (((hi & 0xF) << 8) | lo) + 1;
++				for (int i = 0; i < length && written < total_size; ++i) {
++					dst[written] = (written >= (uint32_t) dist) ? dst[written - dist] : 0;
++					written++;
++				}
++			} else {
++				dst[written++] = (uint8_t) c->busRead8(c, src++);
++			}
++			flags <<= 1;
++		}
++	}
++}
++
++/* Decode a w*h block of 4bpp or 8bpp tile bytes into RGB555 pixels.
++ * Tile layout: 8x8 tile = 32 bytes (4bpp) or 64 bytes (8bpp). Tiles are
++ * stored linearly in row-major order. */
++static void decode_tiles(const uint8_t* tiles, int w, int h, const uint16_t* palette, int is_8bpp,
++                         int hflip, int vflip, uint16_t* out) {
++	int tw = w / 8;
++	for (int py = 0; py < h; ++py) {
++		int sy = vflip ? (h - 1 - py) : py;
++		for (int px = 0; px < w; ++px) {
++			int sx = hflip ? (w - 1 - px) : px;
++			int tile_x = sx / 8, in_x = sx % 8;
++			int tile_y = sy / 8, in_y = sy % 8;
++			int tile_idx = tile_y * tw + tile_x;
++			int color_idx;
++			if (is_8bpp) {
++				int off = tile_idx * 64 + in_y * 8 + in_x;
++				color_idx = tiles[off];
++			} else {
++				int off = tile_idx * 32 + in_y * 4 + (in_x / 2);
++				uint8_t bb = tiles[off];
++				color_idx = (in_x & 1) ? (bb >> 4) : (bb & 0xF);
++			}
++			uint16_t c;
++			if (color_idx == 0) c = 0x8000;  // sentinel: transparent (alpha bit set)
++			else c = palette[color_idx] & 0x7FFF;
++			out[py * w + px] = c;
++		}
++	}
++}
++
++/* Extended signature: (tile_rom_addr, tile_blob_offset, tile_blob_total)
++ * lets the caller point at a sub-range of a larger blob (e.g., one frame
++ * of a 9-frame compressed sprite sheet). For uncompressed: reads
++ * width*height/2 bytes starting at tile_rom_addr + tile_blob_offset.
++ * For compressed: decompresses tile_blob_total bytes from tile_rom_addr,
++ * then takes the slice starting at tile_blob_offset.
++ *
++ * Same for palette: (palette_rom_addr, palette_blob_offset, palette_blob_total),
++ * compressed flag shared with tile (palettes from pokefirered are usually
++ * uncompressed; if so pass palette_blob_total = palette_colors*2 and
++ * palette_blob_offset = 0). */
++EMSCRIPTEN_KEEPALIVE void wasm_set_extra_sprite(
++		int slot,
++		int16_t screen_x, int16_t screen_y,
++		int width, int height,
++		uint32_t tile_rom_addr,
++		uint32_t tile_blob_offset,
++		uint32_t tile_blob_total,
++		int compressed,
++		int is_8bpp,
++		uint32_t palette_rom_addr,
++		uint32_t palette_blob_offset,
++		uint32_t palette_blob_total,
++		int palette_compressed,
++		int palette_colors,
++		int hflip, int vflip,
++		int priority) {
++	if (slot < 0 || slot >= EXTRA_MAX) return;
++	if (width <= 0 || width > EXTRA_MAX_W || height <= 0 || height > EXTRA_MAX_H) return;
++	if (palette_colors < 0 || palette_colors > 256) return;
++	struct mCore* c = wasm_get_core();
++	if (!c) return;
++
++	uint32_t tile_size = (uint32_t)(width * height) / (is_8bpp ? 1 : 2);
++
++	// Decompress / copy tile bytes.
++	static uint8_t blob_buf[16384];
++	uint8_t tile_buf[2048];
++	if (tile_size > sizeof(tile_buf)) tile_size = sizeof(tile_buf);
++	if (compressed) {
++		uint32_t n = tile_blob_total > sizeof(blob_buf) ? sizeof(blob_buf) : tile_blob_total;
++		lz77_decode(c, tile_rom_addr, blob_buf, n);
++		uint32_t off = tile_blob_offset;
++		for (uint32_t i = 0; i < tile_size; ++i) {
++			tile_buf[i] = (off + i < n) ? blob_buf[off + i] : 0;
++		}
++	} else {
++		for (uint32_t i = 0; i < tile_size; ++i) {
++			tile_buf[i] = (uint8_t) c->busRead8(c, tile_rom_addr + tile_blob_offset + i);
++		}
++	}
++
++	// Read palette. Palette is RGB555 halfwords, so palette_colors*2 bytes.
++	uint16_t pal[256] = {0};
++	uint32_t pal_bytes = (uint32_t)palette_colors * 2;
++	if (palette_compressed) {
++		uint32_t n = palette_blob_total > sizeof(blob_buf) ? sizeof(blob_buf) : palette_blob_total;
++		lz77_decode(c, palette_rom_addr, blob_buf, n);
++		for (int i = 0; i < palette_colors; ++i) {
++			uint32_t off = palette_blob_offset + i * 2;
++			uint16_t lo = (off     < n) ? blob_buf[off]     : 0;
++			uint16_t hi = (off + 1 < n) ? blob_buf[off + 1] : 0;
++			pal[i] = lo | (hi << 8);
++		}
++	} else {
++		for (int i = 0; i < palette_colors && i < 256; ++i) {
++			pal[i] = (uint16_t) c->busRead16(c, palette_rom_addr + palette_blob_offset + i * 2);
++		}
++		(void)pal_bytes;
++	}
++
++	struct ExtraSprite* s = &extra_sprites[slot];
++	s->screen_x = screen_x;
++	s->screen_y = screen_y;
++	s->width    = width;
++	s->height   = height;
++	s->priority = priority & 3;
++	decode_tiles(tile_buf, width, height, pal, is_8bpp, hflip, vflip, s->pixels);
++	s->active   = 1;
++}
++
++EMSCRIPTEN_KEEPALIVE void wasm_clear_extra_sprite(int slot) {
++	if (slot < 0 || slot >= EXTRA_MAX) return;
++	extra_sprites[slot].active = 0;
++}
++
++EMSCRIPTEN_KEEPALIVE void wasm_clear_extra_sprites(void) {
++	for (int i = 0; i < EXTRA_MAX; ++i) extra_sprites[i].active = 0;
++}
++
++/* ----------------------------------------------------------------------------
++ * Engine-native peer OBJ injection (mirrors snes9x's gfx.cpp pattern).
++ *
++ * Parallel OAM + OBJ-VRAM + OBJ-palette tables. The renderer's second OBJ
++ * pass (video-software.c::wasm_render_extras_native) swaps these into the
++ * engine state for the duration of the pass, runs PreprocessSprite on each
++ * active entry, then restores. JS writes ROM-resident tile bytes / palette
++ * half-words / OAM attrs directly into the fixed tables via HEAPU8 views
++ * obtained from the *_ptr accessors. No flag — the pass always runs, empty
++ * state renders nothing. */
++
++#define EXTRAS_MAX_OBJ          128
++#define EXTRAS_OBJ_VRAM_BYTES   0x8000           /* 32 KB OBJ VRAM mirror */
++#define EXTRAS_OBJ_PAL_ENTRIES  256              /* 16 OBJ palettes × 16 colors */
++
++static struct GBAObj g_extras_oam[EXTRAS_MAX_OBJ];
++static int           g_extras_obj_active[EXTRAS_MAX_OBJ];
++static uint8_t       g_extras_obj_vram[EXTRAS_OBJ_VRAM_BYTES];
++static uint16_t      g_extras_obj_palette_bgr555[EXTRAS_OBJ_PAL_ENTRIES];
++
++/* Internal C-linkage accessors used by software-obj.c via extern. */
++struct GBAObj* wasm_extras_oam(void)               { return g_extras_oam; }
++int*           wasm_extras_obj_active(void)        { return g_extras_obj_active; }
++uint8_t*       wasm_extras_obj_vram(void)          { return g_extras_obj_vram; }
++uint16_t*      wasm_extras_obj_palette_bgr555(void){ return g_extras_obj_palette_bgr555; }
++int            wasm_extras_max_obj(void)           { return EXTRAS_MAX_OBJ; }
++
++/* ROM access (for atlas builders to read ROM bytes via HEAPU8 directly). */
++EMSCRIPTEN_KEEPALIVE uint8_t*  wasm_rom_ptr(void) {
++	struct mCore* c = wasm_get_core();
++	if (!c) return NULL;
++	struct GBA* gba = (struct GBA*) c->board;
++	return (uint8_t*) gba->memory.rom;
++}
++EMSCRIPTEN_KEEPALIVE uint32_t  wasm_rom_size(void) {
++	struct mCore* c = wasm_get_core();
++	if (!c) return 0;
++	struct GBA* gba = (struct GBA*) c->board;
++	return gba->memory.romSize;
++}
++
++/* Pointer accessors for the fixed parallel-state tables. */
++EMSCRIPTEN_KEEPALIVE uint8_t*  wasm_extras_vram_ptr(void)     { return g_extras_obj_vram; }
++EMSCRIPTEN_KEEPALIVE uint32_t  wasm_extras_vram_size(void)    { return EXTRAS_OBJ_VRAM_BYTES; }
++EMSCRIPTEN_KEEPALIVE uint16_t* wasm_extras_palette_ptr(void)  { return g_extras_obj_palette_bgr555; }
++EMSCRIPTEN_KEEPALIVE uint32_t  wasm_extras_palette_size(void) { return sizeof(g_extras_obj_palette_bgr555); }
++EMSCRIPTEN_KEEPALIVE uint8_t*  wasm_extras_oam_ptr(void)      { return (uint8_t*) g_extras_oam; }
++EMSCRIPTEN_KEEPALIVE uint32_t  wasm_extras_oam_count(void)    { return EXTRAS_MAX_OBJ; }
++
++EMSCRIPTEN_KEEPALIVE void wasm_extras_set_obj(int slot,
++                                              uint16_t a, uint16_t b, uint16_t c) {
++	if (slot < 0 || slot >= EXTRAS_MAX_OBJ) return;
++	g_extras_oam[slot].a = a;
++	g_extras_oam[slot].b = b;
++	g_extras_oam[slot].c = c;
++	g_extras_obj_active[slot] = 1;
++}
++
++EMSCRIPTEN_KEEPALIVE void wasm_extras_clear_objs(void) {
++	memset(g_extras_obj_active, 0, sizeof(g_extras_obj_active));
++}
+--- a/src/gba/renderers/video-software.c	2026-06-24 19:46:01
++++ b/src/gba/renderers/video-software.c	2026-05-27 12:47:25
+@@ -11,6 +11,11 @@
+ #include <mgba/internal/gba/renderers/cache-set.h>
+ 
+ #include <mgba-util/memory.h>
++#include <mgba-util/image.h>  /* PATCHED: mColorFrom555 -- spriteLayer
++                                  expects mColor (native 32-bit), not raw
++                                  RGB555. Writing RGB555 directly made our
++                                  low byte (R5) interpret as the RED
++                                  channel of mColor -> "blood red" cast. */
+ 
+ #define DIRTY_SCANLINE(R, Y) R->scanlineDirty[Y >> 5] |= (1U << (Y & 0x1F))
+ #define CLEAN_SCANLINE(R, Y) R->scanlineDirty[Y >> 5] &= ~(1U << (Y & 0x1F))
+@@ -43,6 +48,8 @@
+ static void GBAVideoSoftwareRendererPreprocessBuffer(struct GBAVideoSoftwareRenderer* renderer);
+ static void GBAVideoSoftwareRendererPostprocessBuffer(struct GBAVideoSoftwareRenderer* renderer);
+ static int GBAVideoSoftwareRendererPreprocessSpriteLayer(struct GBAVideoSoftwareRenderer* renderer, int y);
++/* PATCHED: engine-native peer OBJ render — defined at end of file. */
++int wasm_render_extras_native(struct GBAVideoSoftwareRenderer* renderer, int y);
+ 
+ static void _updatePalettes(struct GBAVideoSoftwareRenderer* renderer);
+ static void _updateFlags(struct GBAVideoSoftwareRenderer* renderer, struct GBAVideoSoftwareBackground* bg);
+@@ -1011,9 +1018,60 @@
+ 						softwareRenderer->row[x] = _brighten(color, softwareRenderer->bldy);
+ 					}
+ 				}
++			}
++		}
++	}
++}
++
++/* PATCHED: extra-sprite renderer hook. See src/platform/wasm/memory.c.
++ * JS sets pre-decoded RGB555 pixels + screen position; we blit per scanline
++ * with priority for BG composite. No GBA semantics. */
++#define EXTRA_MAX             8
++#define EXTRA_MAX_W           32
++#define EXTRA_MAX_H           32
++struct ExtraSprite {
++	int      active;
++	int16_t  screen_x;
++	int16_t  screen_y;
++	int      width;
++	int      height;
++	int      priority;
++	uint16_t pixels[EXTRA_MAX_W * EXTRA_MAX_H];
++};
++extern struct ExtraSprite extra_sprites[EXTRA_MAX];
++
++/* Returns a bitmap of priority levels we wrote to (so the compositor knows
++ * to use the OBJ buffer for those priorities on this scanline). Without
++ * this, our pixels only show up on scanlines where the game's own sprites
++ * are also being drawn -- compositor skips OBJ otherwise. */
++static int wasm_blit_extras_scanline(struct GBAVideoSoftwareRenderer* renderer, int y) {
++	int spriteLayers = 0;
++	for (int i = 0; i < EXTRA_MAX; ++i) {
++		const struct ExtraSprite* s = &extra_sprites[i];
++		if (!s->active) continue;
++		int dy = y - s->screen_y;
++		if (dy < 0 || dy >= s->height) continue;
++		uint32_t flags = (uint32_t) s->priority << OFFSET_PRIORITY;
++		const uint16_t* row = &s->pixels[dy * s->width];
++		int wrote = 0;
++		for (int dx = 0; dx < s->width; ++dx) {
++			int x = s->screen_x + dx;
++			if (x < 0 || x >= GBA_VIDEO_HORIZONTAL_PIXELS) continue;
++			uint16_t c = row[dx];
++			if (c & 0x8000) continue;  // transparent sentinel
++			uint32_t cur = renderer->spriteLayer[x];
++			if ((cur & FLAG_ORDER_MASK) > flags) {
++				/* Convert RGB555 -> mColor (the format the compositor
++				 * expects). Without this, R5 lands in mColor's RED byte
++				 * and we get the "blood red" cast on everything. */
++				uint32_t mc = mColorFrom555(c & 0x7FFF);
++				renderer->spriteLayer[x] = mc | flags;
++				wrote = 1;
+ 			}
+ 		}
++		if (wrote) spriteLayers |= 1 << s->priority;
+ 	}
++	return spriteLayers;
+ }
+ 
+ int GBAVideoSoftwareRendererPreprocessSpriteLayer(struct GBAVideoSoftwareRenderer* renderer, int y) {
+@@ -1060,6 +1118,19 @@
+ 				break;
+ 			}
+ 		}
++
++		/* PATCHED: extra-sprite blitter. Decoded RGB555 pixels are already
++		 * in extra_sprites[].pixels (set by wasm_set_extra_sprite). We
++		 * write into spriteLayer with priority flags so the compositor
++		 * z-orders us correctly against BG layers (and game OBJs). */
++		spriteLayers |= wasm_blit_extras_scanline(renderer, y);
++
++		/* PATCHED: engine-native peer OBJ pass. Parallel OAM in memory.c;
++		 * we swap engine OBJ VRAM + palette with our shadow copies for
++		 * the duration of the pass, run PreprocessSprite on each active
++		 * extras OAM entry, then restore. Peers go through the engine's
++		 * own tile rasterizer + palette lookup. */
++		spriteLayers |= wasm_render_extras_native(renderer, y);
+ 	}
+ 	return spriteLayers;
+ }
+@@ -1111,4 +1182,77 @@
+ 	background->flags = flags;
+ 	background->objwinFlags = objwinFlags;
+ 	background->variant = background->target1 && GBAWindowControlIsBlendEnable(renderer->currentWindow.packed) && (renderer->blendEffect == BLEND_BRIGHTEN || renderer->blendEffect == BLEND_DARKEN);
++}
++
++/* ----------------------------------------------------------------------------
++ * PATCHED: engine-native peer OBJ rendering. See src/platform/wasm/memory.c
++ * for the parallel state. Called from PreprocessSpriteLayer as a second
++ * OBJ pass; swaps engine VRAM+palette with our shadow copies, renders each
++ * active extras OAM entry via the engine's own PreprocessSprite, restores.
++ * Static file-scope swap buffers (32 KB + 1 KB) — would blow the 64 KB
++ * wasm stack if allocated per-call. */
++
++extern struct GBAObj* wasm_extras_oam(void);
++extern int*           wasm_extras_obj_active(void);
++extern uint8_t*       wasm_extras_obj_vram(void);
++extern uint16_t*      wasm_extras_obj_palette_bgr555(void);
++extern int            wasm_extras_max_obj(void);
++
++static uint8_t s_saved_obj_vram[0x8000];
++static mColor  s_saved_obj_palette[256];
++
++int wasm_render_extras_native(struct GBAVideoSoftwareRenderer* renderer, int y) {
++	const int max_obj = wasm_extras_max_obj();
++	int*           active   = wasm_extras_obj_active();
++	struct GBAObj* obj_arr  = wasm_extras_oam();
++
++	int any = 0;
++	for (int i = 0; i < max_obj; ++i) {
++		if (active[i]) { any = 1; break; }
++	}
++	if (!any) return 0;
++
++	uint8_t* engine_vram = ((uint8_t*) renderer->d.vram) + BASE_TILE;
++	memcpy(s_saved_obj_vram, engine_vram, 0x8000);
++	memcpy(engine_vram, wasm_extras_obj_vram(), 0x8000);
++
++	memcpy(s_saved_obj_palette, &renderer->normalPalette[0x100], sizeof(mColor) * 256);
++	const uint16_t* peer_pal = wasm_extras_obj_palette_bgr555();
++	for (int i = 0; i < 256; ++i) {
++		renderer->normalPalette[0x100 + i] = mColorFrom555(peer_pal[i] & 0x7FFF);
++	}
++
++	int spriteLayers = 0;
++	int saved_start = renderer->start;
++	int saved_end   = renderer->end;
++	for (int i = 0; i < max_obj; ++i) {
++		if (!active[i]) continue;
++		struct GBAObj* sprite = &obj_arr[i];
++		if (GBAObjAttributesAIsTransformed(sprite->a)) continue;
++		int objY    = GBAObjAttributesAGetY(sprite->a) + renderer->objOffsetY;
++		int shape   = GBAObjAttributesAGetShape(sprite->a);
++		int size    = GBAObjAttributesBGetSize(sprite->b);
++		int h       = GBAVideoObjSizes[shape * 4 + size][1];
++		int endY    = objY + h;
++		if (y < objY && (endY < 256 || y >= endY - 256)) continue;
++		if (y >= endY) continue;
++
++		for (int w = 0; w < renderer->nWindows; ++w) {
++			renderer->currentWindow = renderer->windows[w].control;
++			renderer->start = w ? renderer->windows[w - 1].endX : 0;
++			renderer->end   = renderer->windows[w].endX;
++			if (!GBAWindowControlIsObjEnable(renderer->currentWindow.packed)
++			    && !GBARegisterDISPCNTIsObjwinEnable(renderer->dispcnt)) {
++				continue;
++			}
++			int drawn = GBAVideoSoftwareRendererPreprocessSprite(renderer, sprite, i, y);
++			spriteLayers |= drawn << GBAObjAttributesCGetPriority(sprite->c);
++		}
++	}
++	renderer->start = saved_start;
++	renderer->end   = saved_end;
++
++	memcpy(engine_vram, s_saved_obj_vram, 0x8000);
++	memcpy(&renderer->normalPalette[0x100], s_saved_obj_palette, sizeof(mColor) * 256);
++	return spriteLayers;
+ }
+--- a/src/platform/wasm/CMakeLists.txt	2026-06-24 19:46:01
++++ b/src/platform/wasm/CMakeLists.txt	2026-05-27 12:56:43
+@@ -2,7 +2,7 @@
+ 	-O3 \
+ 	-s USE_SDL=2 \
+ 	-s TOTAL_MEMORY=256mb \
+-	-s EXPORTED_RUNTIME_METHODS=[\"FS\",\"cwrap\",\"addFunction\",\"removeFunction\"] \
++	-s EXPORTED_RUNTIME_METHODS=[\"FS\",\"cwrap\",\"addFunction\",\"removeFunction\",\"HEAP8\",\"HEAPU8\",\"HEAP16\",\"HEAPU16\",\"HEAP32\",\"HEAPU32\"] \
+ 	-s RESERVED_FUNCTION_POINTERS=16 \
+ 	-s ENVIRONMENT='web,worker' \
+ 	-s PTHREAD_POOL_SIZE=5 \

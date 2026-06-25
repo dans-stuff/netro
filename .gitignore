@@ -1,0 +1,26 @@
+node_modules/
+dist/
+
+# Vendor build artifacts
+vendor/mgba/build-wasm/
+vendor/mgba/cinema/
+vendor/mgba/res/
+vendor/mgba/doc/
+vendor/mgba/src/third-party/sqlite3/
+vendor/byuu-web/higan/obj/
+vendor/byuu-web/higan/out/
+vendor/emsdk/
+vendor/**/*.o
+vendor/**/*.so
+vendor/**/*.dylib
+
+# ROMs (never ship)
+*.gba
+*.gbc
+*.gb
+*.sfc
+*.smc
+*.nes
+roms/
+
+.DS_Store

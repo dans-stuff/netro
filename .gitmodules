@@ -1,0 +1,7 @@
+[submodule "vendor/mgba"]
+	path = vendor/mgba
+	url = https://github.com/thenick775/mgba.git
+	branch = feature/wasm
+[submodule "vendor/byuu-web"]
+	path = vendor/byuu-web
+	url = https://github.com/Wizcorp/byuu-web.git

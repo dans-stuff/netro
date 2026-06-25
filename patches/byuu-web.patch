@@ -1,0 +1,833 @@
+diff --git a/higan/obj/.gitignore b/higan/obj/.gitignore
+deleted file mode 100644
+index 6142305..0000000
+--- a/higan/obj/.gitignore
++++ /dev/null
+@@ -1,2 +0,0 @@
+-*.o
+-*.d
+diff --git a/higan/out/.gitignore b/higan/out/.gitignore
+deleted file mode 100644
+index 72e8ffc..0000000
+--- a/higan/out/.gitignore
++++ /dev/null
+@@ -1 +0,0 @@
+-*
+diff --git a/higan/sfc/cartridge/cartridge.hpp b/higan/sfc/cartridge/cartridge.hpp
+index 7418ffe..7aea17e 100755
+--- a/higan/sfc/cartridge/cartridge.hpp
++++ b/higan/sfc/cartridge/cartridge.hpp
+@@ -1,6 +1,7 @@
+ #include "slot.hpp"
+ 
+ struct Cartridge {
++  friend struct mplay_cart_access;  // mplay: expose rom data for atlas building
+   Node::Peripheral node;
+ 
+   auto manifest() const -> string { return information.manifest; }
+diff --git a/higan/sfc/cpu/cpu.hpp b/higan/sfc/cpu/cpu.hpp
+index b995a06..f670703 100755
+--- a/higan/sfc/cpu/cpu.hpp
++++ b/higan/sfc/cpu/cpu.hpp
+@@ -18,7 +18,7 @@ struct CPU : WDC65816, Thread, PPUcounter {
+   // Set to false to group step executions and execute them once
+   // every 4 cycles
+   struct Lockstep {
+-    bool enabled = true;
++    bool enabled = false;  // mplay: default off for perf
+     uint cycle = 0;
+     uint clocks = 0;
+   } lockstep;
+diff --git a/higan/sfc/ppu-performance/object.cpp b/higan/sfc/ppu-performance/object.cpp
+index 8dfa2b1..0fb4ec8 100644
+--- a/higan/sfc/ppu-performance/object.cpp
++++ b/higan/sfc/ppu-performance/object.cpp
+@@ -124,6 +124,74 @@ auto PPU::Object::render() -> void {
+     if(io.aboveEnable && !windowAbove[x]) ppu.dac.plotAbove(x, source, priority[x], ppu.dac.cgram[palette[x]]);
+     if(io.belowEnable && !windowBelow[x]) ppu.dac.plotBelow(x, source, priority[x], ppu.dac.cgram[palette[x]]);
+   }
++
++  // mplay extras pass — ghost sprites from peer adapters.
++  // Shadow tables written by TypeScript worker; cleared each frame before render.
++  mplayRenderExtras(windowAbove, windowBelow);
++}
++
++// mplay extras-pass forward declarations. Break out of higan::SuperFamicom
++// so the externs resolve against the file-scope globals in mplay_extras.cpp.
++}  // end namespace higan::SuperFamicom
++struct MplayExtraObj { int16_t x, y; uint16_t tile; uint8_t palette, priority, hflip, vflip, width, height; };
++extern uint8_t       mplay_extras_vram[];
++extern uint8_t       mplay_extras_cgram[];
++extern MplayExtraObj mplay_extras_obj[];
++extern "C" uint32_t  mplay_extras_obj_count();
++namespace higan::SuperFamicom {  // reopen
++
++auto PPU::Object::mplayRenderExtras(bool* windowAbove, bool* windowBelow) -> void {
++
++  const uint32_t count = mplay_extras_obj_count();
++  const uint  scanline = ppu.vcounter();
++
++  for(uint32_t i = 0; i < count; i++) {
++    const auto& obj = mplay_extras_obj[i];
++    if(!obj.tile && !obj.palette) continue;  // empty slot
++
++    const uint w = obj.width  ? obj.width  : 8;
++    const uint h = obj.height ? obj.height : 8;
++    const uint tileW = w >> 3;
++    const uint tileH = h >> 3;
++
++    for(uint ty = 0; ty < tileH; ty++) {
++      int sy = obj.y + (obj.vflip ? (tileH - 1 - ty) : ty) * 8;
++      if(sy < 0 || (uint)sy > scanline || (uint)sy + 7 < scanline) continue;
++      uint row = scanline - sy;
++      if(obj.vflip) row = 7 - row;
++
++      for(uint tx = 0; tx < tileW; tx++) {
++        int sx = (int16_t)obj.x + (obj.hflip ? (tileW - 1 - tx) : tx) * 8;
++        uint tileIdx = obj.tile + ty * tileW + tx;
++        const uint8_t* tileData = mplay_extras_vram + tileIdx * 32;
++        uint rowOff = row * 2;
++        uint8_t lo = tileData[rowOff];
++        uint8_t hi = tileData[rowOff + 1];
++        uint8_t lo2 = tileData[rowOff + 16];
++        uint8_t hi2 = tileData[rowOff + 17];
++
++        for(uint px = 0; px < 8; px++) {
++          int screenX = sx + (obj.hflip ? 7 - px : px);
++          if(screenX < 0 || screenX >= 256) continue;
++          uint shift = 7 - px;
++          uint color = ((lo  >> shift) & 1)
++                     | (((hi  >> shift) & 1) << 1)
++                     | (((lo2 >> shift) & 1) << 2)
++                     | (((hi2 >> shift) & 1) << 3);
++          if(!color) continue;
++          uint8_t cgramIdx = (obj.palette << 4) + color;
++          uint16_t bgr555 = (uint16_t)mplay_extras_cgram[cgramIdx * 2]
++                          | ((uint16_t)mplay_extras_cgram[cgramIdx * 2 + 1] << 8);
++          uint8_t priVal = io.priority[obj.priority & 3];
++          // Match the regular OBJ pass: source is OBJ1 if (128+cgramIdx) < 192,
++          // i.e. cgramIdx < 64 (palettes 0-3). Palettes 4-7 → OBJ2.
++          uint8_t src = (128 + cgramIdx) < 192 ? PPU::Source::OBJ1 : PPU::Source::OBJ2;
++          if(io.aboveEnable && !windowAbove[screenX]) ppu.dac.plotAbove(screenX, src, priVal, bgr555);
++          if(io.belowEnable && !windowBelow[screenX]) ppu.dac.plotBelow(screenX, src, priVal, bgr555);
++        }
++      }
++    }
++  }
+ }
+ 
+ auto PPU::Object::power() -> void {
+diff --git a/higan/sfc/ppu-performance/object.hpp b/higan/sfc/ppu-performance/object.hpp
+index eb5ad94..0288dae 100644
+--- a/higan/sfc/ppu-performance/object.hpp
++++ b/higan/sfc/ppu-performance/object.hpp
+@@ -3,6 +3,7 @@ struct Object {
+   alwaysinline auto addressReset() -> void;
+   alwaysinline auto setFirstSprite() -> void;
+   alwaysinline auto render() -> void;
++  auto mplayRenderExtras(bool* windowAbove, bool* windowBelow) -> void;
+   auto power() -> void;
+ 
+   //serialization.cpp
+diff --git a/higan/sfc/ppu-performance/ppu.cpp b/higan/sfc/ppu-performance/ppu.cpp
+index 867a260..7d070f9 100644
+--- a/higan/sfc/ppu-performance/ppu.cpp
++++ b/higan/sfc/ppu-performance/ppu.cpp
+@@ -21,14 +21,14 @@ auto PPU::load(Node::Object parent, Node::Object from) -> void {
+ 
+   screen = Node::append<Node::Screen>(parent, from, "Screen");
+   screen->colors(1 << 19, {&PPU::color, this});
+-  screen->setSize(512, 480);
+-  screen->setScale(0.5, 0.5);
++  screen->setSize(256, 240);  // mplay: native size, no hi-res support
++  screen->setScale(1.0, 1.0);
+   screen->setAspect(8.0, 7.0);
+   from = Node::scan(parent = screen, from);
+ 
+   region = Node::append<Node::String>(parent, from, "Region", "PAL", [&](auto region) {
+-    if(region == "NTSC") screen->setSize(512, 448);
+-    if(region == "PAL" ) screen->setSize(512, 480);
++    if(region == "NTSC") screen->setSize(256, 224);  // mplay
++    if(region == "PAL" ) screen->setSize(256, 240);  // mplay
+   });
+   region->setAllowedValues({"NTSC", "PAL"});
+   region->setDynamic(true);
+@@ -118,6 +118,8 @@ auto PPU::power(bool reset) -> void {
+   PPUcounter::reset();
+ 
+   memory::fill<uint32>(output, 512 * 480);
++  skip = false;
++  hasRendered = false;
+ 
+   ppu1.version = 1, ppu1.mdr = 0x00;
+   ppu2.version = 3, ppu2.mdr = 0x00;
+diff --git a/higan/sfc/ppu-performance/ppu.hpp b/higan/sfc/ppu-performance/ppu.hpp
+index e412ea6..91d5df8 100644
+--- a/higan/sfc/ppu-performance/ppu.hpp
++++ b/higan/sfc/ppu-performance/ppu.hpp
+@@ -1,4 +1,6 @@
+ struct PPU : Thread, PPUcounter {
++  friend struct mplay_ppu_access;  // mplay: expose private regions to mplay_extras.cpp
++
+   Node::Component node;
+   Node::Screen screen;
+   Node::String region;
+@@ -6,7 +8,7 @@ struct PPU : Thread, PPUcounter {
+ 
+   double overclock = 1.0;
+   bool hasRendered = false;
+-  bool isSkipping = false;
++  bool isSkipping = true;  // mplay: PPU render skipped on alt frames; audio + CPU stay at 60Hz
+   bool skip = false;
+ 
+   inline auto hires() const -> bool { return io.pseudoHires || io.bgMode == 5 || io.bgMode == 6; }
+diff --git a/higan/sfc/smp/smp.hpp b/higan/sfc/smp/smp.hpp
+index 72cb828..2bd01c4 100755
+--- a/higan/sfc/smp/smp.hpp
++++ b/higan/sfc/smp/smp.hpp
+@@ -4,7 +4,7 @@ struct SMP : SPC700, Thread {
+   int firstRun = 1;
+   
+   struct Lockstep {
+-    bool enabled = true;
++    bool enabled = false;  // mplay: default off for perf
+     uint cycle = 0;
+     uint clocks = 0;
+   } lockstep;
+diff --git a/higan/target-web/GNUmakefile b/higan/target-web/GNUmakefile
+index 046d5fa..edf68ab 100644
+--- a/higan/target-web/GNUmakefile
++++ b/higan/target-web/GNUmakefile
+@@ -58,15 +58,13 @@ flags += \
+ 	-ffinite-math-only \
+ 	-ffp-model=fast \
+ 	--bind \
+-	-s ENVIRONMENT=web \
++	-s ENVIRONMENT=web,worker,node \
+ 	-s DISABLE_EXCEPTION_CATCHING=1 \
+-	-s USE_SDL=2 \
+-	-s USE_SDL_MIXER=0 \
+-	-s USE_SDL_IMAGE=0 \
+ 	-s TOTAL_MEMORY=160MB \
+-	-s ALLOW_MEMORY_GROWTH=0
++	-s ALLOW_MEMORY_GROWTH=1 \
++	-s EXPORTED_FUNCTIONS=_mplay_getPixelPtr,_mplay_getPixelMaxW,_mplay_getPixelMaxH,_mplay_getActiveW,_mplay_getActiveH,_mplay_getAudioRingPtr,_mplay_getAudioRingCapacity,_mplay_getAudioWriteIdx,_mplay_runOneFrame,_mplay_getRomPtr,_mplay_getRomSize,_mplay_getRamPtr,_mplay_getRamSize,_mplay_getVramPtr,_mplay_getVramSize,_mplay_getCgramPtr,_mplay_getCgramSize,_mplay_getOamPtr,_mplay_getOamSize,_mplay_callSubroutine,_mplay_extras_obj_ptr,_mplay_extras_obj_count,_mplay_extras_vram_ptr,_mplay_extras_vram_size,_mplay_extras_cgram_ptr,_mplay_extras_cgram_size,_mplay_extras_clear,_mplay_powerCycle,_mplay_videoClear,_mplay_videoResetDebug,_mplay_stateLoadRaw,_malloc,_free
+ 
+-objects += web-resource web-emulator web-video web-audio web-platform web
++objects += web-resource web-emulator web-video web-audio web-platform web mplay-extras
+ objects += icarus icarus-resource
+ objects := $(objects:%=obj/%.o)
+ 
+@@ -76,6 +74,7 @@ obj/web-video.o: $(ui)/video/video.cpp
+ obj/web-audio.o: $(ui)/audio/audio.cpp
+ obj/web-platform.o: $(ui)/platform/platform.cpp
+ obj/web.o: $(ui)/web.cpp
++obj/mplay-extras.o: $(ui)/mplay_extras.cpp
+ obj/icarus.o: ../icarus/icarus.cpp
+ obj/icarus-resource.o: ../icarus/resource/resource.cpp
+ 
+@@ -85,11 +84,13 @@ package: $(objects)
+ 		$(flags) \
+ 		-s MODULARIZE=1 \
+ 		-s EXPORT_ES6=1 \
+-		-s USE_ES6_IMPORT_META=0 \
++		-s ASSERTIONS=1 \
++		-s 'EXPORTED_RUNTIME_METHODS=["run","ccall","cwrap","HEAPU8","HEAPU16","HEAPU32"]' \
++		--profiling-funcs \
+ 		-o ./out/package/$(name)-lib.js \
+ 		$(objects)
+ 
+-	wasm-strip ./out/package/byuu-web-lib.wasm
++	# wasm-strip ./out/package/byuu-web-lib.wasm  # mplay: keep symbols for debugging
+ 
+ 	cp ./target-web/package.json ./out/package/
+ 	cp ../README.md ./out/package/
+diff --git a/higan/target-web/api.js b/higan/target-web/api.js
+index 4e9ff8a..e8c7b85 100644
+--- a/higan/target-web/api.js
++++ b/higan/target-web/api.js
+@@ -60,11 +60,7 @@ export const commit = '$commit'
+ export const dirty = $dirty
+ 
+ function getBinaryPath() {
+-  try {
+-    return require('./byuu-web-lib.wasm').default
+-  } catch (error) {
+-    throw new Error('Failed to load WASM code - see https://github.com/Wizcorp/byuu-web#failed-to-load-wasm-code')
+-  }
++  return new URL('./byuu-web-lib.wasm', import.meta.url).href
+ }
+ 
+ function getModule() {
+diff --git a/higan/target-web/audio/audio.cpp b/higan/target-web/audio/audio.cpp
+index 3a51a70..783b420 100644
+--- a/higan/target-web/audio/audio.cpp
++++ b/higan/target-web/audio/audio.cpp
+@@ -1,121 +1,34 @@
+ #include "../web.hpp"
+ 
+-void WebAudio::initialize() {
+-    // Audio
+-    if (!device) {
+-        device = alcOpenDevice(NULL);
+-    }
+-
+-    if (!context) {
+-        //Create a context
+-        context = alcCreateContext(device, NULL);
+-        
+-        //Set active context
+-        alcMakeContextCurrent(context);
+-
+-        // generate audio source
+-        alGenSources(1, &source);
+-
+-        setVolume(volume);
+-        alListener3f(AL_POSITION, 0.0, 0.0, 0.0);
+-        alListener3f(AL_VELOCITY, 0.0, 0.0, 0.0);
+-        ALfloat listenerOrientation[] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+-        alListenerfv(AL_ORIENTATION, listenerOrientation);
+-
+-        // This bit of code is needed to allow iOS to play the audio
+-        // Note: previous implementations included a hack to allow audio even on silent mode
+-        // See: https://github.com/Wizcorp/byuu-web/commit/1c28542c7a2c68fcd57332516d361cec18f3dfef
+-        // See: https://stackoverflow.com/a/46839941/262831
+-        EM_ASM({
+-            window.addEventListener('touchstart', () => {
+-                const { audioCtx } = AL.currentCtx;
+-                if(audioCtx.state == 'suspended') {
+-                    audioCtx.resume();
+-                }
+-            }, { once: true });
+-        });
+-    }
+-
+-    // See: https://emscripten.org/docs/porting/Audio.html#useful-implementation-details-of-openal-capture
+-    if (!frequency) {
+-        frequency = EM_ASM_INT({
+-            var AudioContext = window.AudioContext || window.webkitAudioContext;
+-            var ctx = new AudioContext();
+-            var sr = ctx.sampleRate;
+-            ctx.close();
+-            return sr;
+-        });
+-    }
+-
+-    uint size = frequency * latency / 1000.0 + 0.5;
+-
+-    if (size != bufferSize) {
+-        delete [] buffer;
+-        bufferSize = size;
+-        buffer = new uint32_t[bufferSize]();
+-    }
+-}
+-
+-void WebAudio::setVolume(uint volume) {
+-    alSourcef(source, AL_GAIN, (float) volume / 100.0f);
+-    this->volume = volume;
++// mplay: bypass OpenAL. Write stereo int16 samples directly to a ring; JS worker drains it.
++// Ring layout matches lakesnes: capacity stereo-pairs, head/tail in atomic slots.
++// Capacity must be power-of-two-ish; we use 32768 stereo pairs = 1.4s at 48kHz.
++#define MPLAY_AUDIO_CAPACITY 65536  // int16 slots (stereo interleaved)
++static int16_t g_audioRing[MPLAY_AUDIO_CAPACITY];
++static volatile uint32_t g_audioWriteIdx = 0;  // next slot to write
++
++extern "C" {
++  EMSCRIPTEN_KEEPALIVE int16_t* mplay_getAudioRingPtr() { return g_audioRing; }
++  EMSCRIPTEN_KEEPALIVE int mplay_getAudioRingCapacity() { return MPLAY_AUDIO_CAPACITY; }
++  EMSCRIPTEN_KEEPALIVE uint32_t mplay_getAudioWriteIdx() { return g_audioWriteIdx; }
+ }
+ 
+-void WebAudio::terminate() {    
+-    alSourceStop(source);
+-    bufferLength = 0;
++void WebAudio::initialize() {
++    // no-op; JS owns the audio path
++    frequency = 48000;
+ }
+ 
+-bool WebAudio::resume() {
+-    return EM_ASM_INT({
+-        if(!AL || !AL.currentCtx) {
+-            return 0;
+-        }
+-
+-        const { audioCtx } = AL.currentCtx;
+-        if(audioCtx.state == 'suspended') {
+-            audioCtx.resume();
+-        }
+-
+-        return 1;
+-    });
+-}
++void WebAudio::setVolume(uint v) { volume = v; }
++void WebAudio::terminate() {}
++bool WebAudio::resume() { return true; }
+ 
+ void WebAudio::output(float samples[2]) {
+-    if (muted || device == nullptr || context == nullptr) {
+-        return;
+-    }
+-
+-    buffer[bufferLength]  = (uint16_t)sclamp<16>(samples[0] * 32767.0) <<  0;
+-    buffer[bufferLength] |= (uint16_t)sclamp<16>(samples[1] * 32767.0) << 16;
+-    
+-    if(++bufferLength < bufferSize) {
+-        return;
+-    }
+-
+-    ALuint alBuffer = 0;
+-    int processed = 0;
+-    
+-    while(true) {
+-        alGetSourcei(source, AL_BUFFERS_PROCESSED, &processed);
+-        while(processed--) {
+-            alSourceUnqueueBuffers(source, 1, &alBuffer);
+-            alDeleteBuffers(1, &alBuffer);
+-            queueLength--;
+-        }
+-        //wait for buffer playback to catch up to sample generation if not synchronizing
+-        if(!blocking || queueLength < 3) break;
+-    }
+-
+-    if(queueLength < 3) {
+-        alGenBuffers(1, &alBuffer);
+-        alBufferData(alBuffer, AL_FORMAT_STEREO16, buffer, bufferSize * 4, frequency);
+-        alSourceQueueBuffers(source, 1, &alBuffer);
+-        queueLength++;
+-    }
+-
+-    ALint playing;
+-    alGetSourcei(source, AL_SOURCE_STATE, &playing);
+-    if(playing != AL_PLAYING) alSourcePlay(source);
+-    bufferLength = 0;
+-}
+\ No newline at end of file
++    if (muted) return;
++    // clamp + convert to int16
++    float l = samples[0]; if (l > 1) l = 1; if (l < -1) l = -1;
++    float r = samples[1]; if (r > 1) r = 1; if (r < -1) r = -1;
++    uint32_t w = g_audioWriteIdx;
++    g_audioRing[w] = (int16_t)(l * 32767.0f);
++    g_audioRing[(w + 1) % MPLAY_AUDIO_CAPACITY] = (int16_t)(r * 32767.0f);
++    g_audioWriteIdx = (w + 2) % MPLAY_AUDIO_CAPACITY;
++}
+diff --git a/higan/target-web/audio/audio.hpp b/higan/target-web/audio/audio.hpp
+index 4abc109..a224bc2 100644
+--- a/higan/target-web/audio/audio.hpp
++++ b/higan/target-web/audio/audio.hpp
+@@ -1,24 +1,10 @@
+-#include <AL/al.h>
+-#include <AL/alc.h>
+-
++// mplay: OpenAL bypassed; audio samples written to a ring exposed to JS.
+ struct WebAudio {
+ 	bool initialized = false;
+-
+-	ALCdevice *device = nullptr;
+-	ALCcontext *context = nullptr;
+-	ALuint source = 0;
+-
+-	uint frequency;
++	uint frequency = 48000;
+ 	uint latency = 120;
+ 	uint volume = 100;
+-
+ 	bool muted = false;
+-	bool blocking = false;
+-
+-	uint queueLength = 0;
+-	uint32_t* buffer = nullptr;
+-	uint bufferLength = 0;
+-	uint bufferSize = 0;
+ 
+ 	void initialize();
+ 	void terminate();
+@@ -26,4 +12,4 @@ struct WebAudio {
+ 	bool resume();
+ 	void setVolume(uint volume);
+ 	void output(float samples[2]);
+-};
+\ No newline at end of file
++};
+diff --git a/higan/target-web/video/video.cpp b/higan/target-web/video/video.cpp
+index 10adb4b..3566663 100644
+--- a/higan/target-web/video/video.cpp
++++ b/higan/target-web/video/video.cpp
+@@ -1,83 +1,74 @@
+ #include "../web.hpp"
++#include <string.h>
++#include <stdio.h>
+ 
+-void WebVideo::initialize(const char* windowTitle) {
+-    if (!renderer) {
+-        SDL_SetHint(SDL_HINT_EMSCRIPTEN_ASYNCIFY, "0");
+-
+-        DEBUG_LOG("Initializing video\n");
+-
+-        // Disable event handler setup
+-        EM_ASM({
+-             window.realHandler = JSEvents.registerOrRemoveHandler;
+-             JSEvents.registerOrRemoveHandler = () => true;
+-        });
++// mplay: bypass SDL entirely. Copy pixel rows into a fixed buffer that JS reads via getPixelPtr().
++// Fixed buffer is 512x480 RGBA (the max byuu PPU emits, hi-res frames fit too).
++#define MPLAY_PX_W 512
++#define MPLAY_PX_H 480
++static uint8_t g_pxBuf[MPLAY_PX_W * MPLAY_PX_H * 4];
+ 
+-        assert(SDL_Init(SDL_INIT_VIDEO) == 0);
+-        window = SDL_CreateWindow(windowTitle, 0, 0, width, height, SDL_WINDOW_SHOWN);
+-        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
++static int g_activeW = 256, g_activeH = 224;
++static int g_debugFrames = 0;  // counts down; log while > 0
+ 
+-        // Re-enable event handler setup
+-        EM_ASM({
+-             JSEvents.registerOrRemoveHandler = window.realHandler;
+-             delete window.realHandler;
+-        });
+-    }
++extern "C" {
++  EMSCRIPTEN_KEEPALIVE uint8_t* mplay_getPixelPtr() { return g_pxBuf; }
++  EMSCRIPTEN_KEEPALIVE int mplay_getPixelMaxW() { return MPLAY_PX_W; }
++  EMSCRIPTEN_KEEPALIVE int mplay_getPixelMaxH() { return MPLAY_PX_H; }
++  EMSCRIPTEN_KEEPALIVE int mplay_getActiveW() { return g_activeW; }
++  EMSCRIPTEN_KEEPALIVE int mplay_getActiveH() { return g_activeH; }
+ }
+ 
+-void WebVideo::terminate() {
+-    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+-    SDL_RenderClear(renderer);
++void WebVideo::initialize(const char* windowTitle) {
++    // mplay: no SDL window/renderer needed. Worker provides the canvas via OffscreenCanvas+WebGL.
++    memset(g_pxBuf, 0, sizeof g_pxBuf);
++    g_activeW = 256; g_activeH = 224;
+ }
+ 
+-void WebVideo::render(const void *data, uint pitch, uint frameWidth, uint frameHeight, double screenScaleX, double screenScaleY) {
+-    if (
+-        texture 
+-        && (
+-            width != frameWidth 
+-            || height != frameHeight 
+-            || fabs(screenScaleX - scaleX) > 0.1
+-            || fabs(screenScaleY - scaleY) > 0.1
+-        )
+-    ) {
+-        SDL_DestroyTexture(texture);
+-        texture = nullptr;
+-    }
++extern "C" {
++  EMSCRIPTEN_KEEPALIVE void mplay_videoClear() {
++    memset(g_pxBuf, 0, sizeof g_pxBuf);
++    g_activeW = 256; g_activeH = 224;
++  }
++  EMSCRIPTEN_KEEPALIVE void mplay_videoResetDebug() {
++    g_debugFrames = 16;
++  }
++}
+ 
+-    if (texture == nullptr) {
+-        width = frameWidth; 
+-        height = frameHeight;
+-        scaleX = screenScaleX;
+-        scaleY = screenScaleY;
+-        
+-        texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGB888, SDL_TEXTUREACCESS_STREAMING, frameWidth, frameHeight);
++void WebVideo::terminate() {}
+ 
+-        // make screen size double the texture size to increase the render quality;
+-        // additional stretching should be done in CSS by the end-user
+-        scaledWidth = frameWidth * 2; 
+-        scaledHeight = frameHeight * 2;
++void WebVideo::render(const void *data, uint pitch, uint frameWidth, uint frameHeight, double screenScaleX, double screenScaleY) {
++    width = frameWidth;
++    height = frameHeight;
++    scaleX = screenScaleX;
++    scaleY = screenScaleY;
++    g_activeW = frameWidth;
++    g_activeH = frameHeight;
+ 
+-        if (scaleX != 0 && scaleY != 0) {
+-            double ratio = scaleX / scaleY;
+-        
+-            if (ratio > 1) {
+-                scaledWidth *= ratio;
+-            } else {
+-                scaledHeight *= (1/ratio);
+-            }
+-        }
++    if (!onResizeCallback.isNull() && (frameWidth != mplay_lastW || frameHeight != mplay_lastH)) {
++        mplay_lastW = frameWidth;
++        mplay_lastH = frameHeight;
++        onResizeCallback(emscripten::val(frameWidth), emscripten::val(frameHeight));
++    }
+ 
+-        SDL_SetWindowSize(window, scaledWidth, scaledHeight);
++    if (g_debugFrames > 0) {
++        printf("[mplay-video] render h=%u w=%u pitch=%u (debug frames left=%d)\n",
++               frameHeight, frameWidth, pitch, g_debugFrames);
++        g_debugFrames--;
++    }
+ 
+-        if (!onResizeCallback.isNull()) {
+-            onResizeCallback(emscripten::val(scaledWidth), emscripten::val(scaledHeight));
+-        }
++    // Copy frame into our exposed buffer, row by row (source has 'pitch' bytes per row, may be wider than frameWidth*4).
++    const uint8_t* src = (const uint8_t*)data;
++    uint8_t* dst = g_pxBuf;
++    const uint copyBytes = frameWidth * 4;
++    const uint dstPitch = MPLAY_PX_W * 4;
++    for (uint y = 0; y < frameHeight; y++) {
++        memcpy(dst, src, copyBytes);
++        src += pitch;
++        dst += dstPitch;
+     }
+-    
+-    SDL_UpdateTexture(texture, nullptr, data, pitch);
+-    SDL_RenderCopy(renderer, texture, nullptr, nullptr);
+-    SDL_RenderPresent(renderer);
+ }
+ 
+ auto WebVideo::onResize(emscripten::val callback) -> void {
+     onResizeCallback = callback;
+-}
+\ No newline at end of file
++}
+diff --git a/higan/target-web/video/video.hpp b/higan/target-web/video/video.hpp
+index 74c5238..eca9165 100644
+--- a/higan/target-web/video/video.hpp
++++ b/higan/target-web/video/video.hpp
+@@ -1,17 +1,11 @@
+-#include <SDL2/SDL.h>
+-
++// mplay: SDL bypassed; pixels copied into a static buffer exposed to JS.
+ struct WebVideo {
+-	SDL_Window *window = nullptr;
+-	SDL_Renderer *renderer = nullptr;
+-	SDL_Texture *texture = nullptr;
+-
+ 	uint width = 256;
+ 	uint height = 224;
+ 	double scaleX = 1;
+ 	double scaleY = 1;
+-
+-	double scaledWidth = width * 2;
+-	double scaledHeight = height * 2;
++	uint mplay_lastW = 0;
++	uint mplay_lastH = 0;
+ 
+ 	emscripten::val onResizeCallback = emscripten::val::null();
+ 
+diff --git a/higan/target-web/web.cpp b/higan/target-web/web.cpp
+index 2ef8682..e3ddf41 100644
+--- a/higan/target-web/web.cpp
++++ b/higan/target-web/web.cpp
+@@ -7,6 +7,12 @@ emscripten::val scheduledStateSave = emscripten::val::null();
+ bool isStarted() { return webplatform->started; }
+ bool isRunning() { return webplatform->running; }
+ 
++// mplay: unthrottled single-frame entry, called from JS worker tick (already vsync-paced).
++extern "C" EMSCRIPTEN_KEEPALIVE void mplay_runOneFrame() {
++    if (!webplatform) return;
++    webplatform->run();
++}
++
+ static uint lastExecution = chrono::millisecond();
+ 
+ void run() {
+@@ -109,6 +115,13 @@ void stateSave(emscripten::val callback) {
+ }
+ 
+ bool stateLoad(std::string state) { return webplatform->stateLoad(state.c_str(), state.size()); }
++
++// mplay: binary-safe stateLoad — takes a heap pointer + byte length so the
++// caller can avoid the JS-string→UTF-8 encoding that corrupts bytes > 127.
++extern "C" EMSCRIPTEN_KEEPALIVE bool mplay_stateLoadRaw(intptr_t ptr, int len) {
++  if (!webplatform) return false;
++  return webplatform->stateLoad((const char*)ptr, (size_t)len);
++}
+ emscripten::val save() { return webplatform->save(); }
+ 
+ EMSCRIPTEN_BINDINGS(my_module) {
+diff --git a/higan/target-web/mplay_extras.cpp b/higan/target-web/mplay_extras.cpp
+new file mode 100644
+--- /dev/null
++++ b/higan/target-web/mplay_extras.cpp
+@@ -0,0 +1,147 @@
++// mplay extras: byuu-side primitives exposed to JS so all game-specific code
++// can live in TypeScript (worker) rather than C++.
++//
++// Two friend structs (mplay_ppu_access, mplay_cart_access) are declared in
++// byuu's ppu.hpp / cartridge.hpp so we can reach the private regions without
++// adding accessor methods to every class. That's the ONLY edit those headers
++// receive — everything else lives here.
++
++#include <emscripten.h>
++#include <stdint.h>
++#include <string.h>
++#include <stdio.h>
++
++#include "../sfc/sfc.hpp"
++
++// Friend trampolines MUST live in higan::SuperFamicom namespace to match the
++// friend declarations in ppu.hpp / cartridge.hpp. C++ friend lookup happens
++// in the namespace of the befriending class.
++namespace higan { namespace SuperFamicom {
++  struct mplay_ppu_access {
++    static void* vram_data() { return ppu.vram.data; }
++    static void* cgram_data() { return ppu.dac.cgram; }
++    static void* oam_data() { return ppu.obj.oam.objects; }
++    static uint32_t oam_size() { return sizeof(ppu.obj.oam.objects); }
++  };
++  struct mplay_cart_access {
++    static void* rom_data() { return cartridge.rom.data(); }
++    static uint32_t rom_size() { return cartridge.rom.size(); }
++  };
++}}
++
++using higan::SuperFamicom::mplay_ppu_access;
++using higan::SuperFamicom::mplay_cart_access;
++using higan::SuperFamicom::cpu;
++
++// ---- region pointer exports ------------------------------------------------
++
++extern "C" {
++
++EMSCRIPTEN_KEEPALIVE uint8_t* mplay_getRomPtr() {
++  return (uint8_t*)mplay_cart_access::rom_data();
++}
++EMSCRIPTEN_KEEPALIVE uint32_t mplay_getRomSize() {
++  return mplay_cart_access::rom_size();
++}
++
++EMSCRIPTEN_KEEPALIVE uint8_t* mplay_getRamPtr() {
++  return (uint8_t*)&cpu.wram[0];  // public; uint8 = Natural<8>, address as bytes
++}
++EMSCRIPTEN_KEEPALIVE uint32_t mplay_getRamSize() {
++  return sizeof(cpu.wram);
++}
++
++EMSCRIPTEN_KEEPALIVE uint8_t* mplay_getVramPtr() {
++  return (uint8_t*)mplay_ppu_access::vram_data();
++}
++EMSCRIPTEN_KEEPALIVE uint32_t mplay_getVramSize() {
++  return 65536;  // 64KB
++}
++
++EMSCRIPTEN_KEEPALIVE uint8_t* mplay_getCgramPtr() {
++  return (uint8_t*)mplay_ppu_access::cgram_data();
++}
++EMSCRIPTEN_KEEPALIVE uint32_t mplay_getCgramSize() {
++  return 512;
++}
++
++EMSCRIPTEN_KEEPALIVE uint8_t* mplay_getOamPtr() {
++  return (uint8_t*)mplay_ppu_access::oam_data();
++}
++EMSCRIPTEN_KEEPALIVE uint32_t mplay_getOamSize() {
++  return mplay_ppu_access::oam_size();
++}
++
++// ---- callSubroutine --------------------------------------------------------
++// Runs a 65816 subroutine to completion without saving/restoring CPU state.
++// Safe to call at any point (frame 0, mid-atlas, etc.) because:
++//   1. Stack is forced to a known safe address ($01F0) so the exit condition
++//      is always well-defined regardless of prior emulator state.
++//   2. CPU is switched to native mode (E=0) with 8-bit accumulator/index
++//      (M=X=1), which matches the expected call convention for all game
++//      decoders we invoke.
++// State corruption is intentional: the caller power-cycles after atlas
++// building, so nothing here needs to survive.
++
++EMSCRIPTEN_KEEPALIVE void mplay_callSubroutine(uint32_t targetAddr) {
++  // Force CPU to a known, safe state before every call.
++  cpu.r.e   = 0;     // native mode (not emulation)
++  cpu.r.p.m = 1;     // 8-bit accumulator
++  cpu.r.p.x = 1;     // 8-bit index registers
++  cpu.r.s.w = 0x01F0; // stack in WRAM page 1, well away from zero-page / vectors
++
++  const uint16_t initial_S = cpu.r.s.w;  // = 0x01F0
++
++  auto pushByte = [&](uint8_t v) {
++    cpu.write(cpu.r.s.w, v);
++    cpu.r.s.w = cpu.r.s.w - 1;
++  };
++  // Push 3 bytes to handle both call conventions:
++  //   RTS (JSR caller): pops PCL+PCH (2)       → S ends at initial_S - 1
++  //   RTL (JSL caller): pops PCL+PCH+bank (3)  → S ends at initial_S
++  // We exit when S >= initial_S - 1 (true for both).
++  // Return target: bank $00, addr $FFFE (unreachable safe address).
++  pushByte(0x00);  // return bank (consumed by RTL; left on stack by RTS)
++  pushByte(0xFF);  // PCH of return addr - 1
++  pushByte(0xFD);  // PCL of return addr - 1
++
++  cpu.r.pc.d = targetAddr & 0xffffff;
++
++  while (cpu.r.s.w < (uint16_t)(initial_S - 1)) {
++    cpu.instruction();
++  }
++}
++
++// ---- powerCycle ------------------------------------------------------------
++
++EMSCRIPTEN_KEEPALIVE void mplay_powerCycle() {
++  higan::SuperFamicom::system.power(false);
++}
++
++}  // extern "C"
++
++// ---- extras-pass shadow tables --------------------------------------------
++
++#include "mplay_extras.hpp"
++#define MPLAY_EXTRA_OBJ_COUNT 128
++MplayExtraObj mplay_extras_obj[MPLAY_EXTRA_OBJ_COUNT];
++uint8_t mplay_extras_vram[32768];
++uint8_t mplay_extras_cgram[256];  // 128 words; covers one full OBJ palette row (8×16 colours)
++
++extern "C" {
++
++EMSCRIPTEN_KEEPALIVE void* mplay_extras_obj_ptr() { return mplay_extras_obj; }
++EMSCRIPTEN_KEEPALIVE uint32_t mplay_extras_obj_count() { return MPLAY_EXTRA_OBJ_COUNT; }
++EMSCRIPTEN_KEEPALIVE uint8_t* mplay_extras_vram_ptr() { return mplay_extras_vram; }
++EMSCRIPTEN_KEEPALIVE uint32_t mplay_extras_vram_size() { return sizeof(mplay_extras_vram); }
++EMSCRIPTEN_KEEPALIVE uint8_t* mplay_extras_cgram_ptr() { return mplay_extras_cgram; }
++EMSCRIPTEN_KEEPALIVE uint32_t mplay_extras_cgram_size() { return sizeof(mplay_extras_cgram); }
++
++EMSCRIPTEN_KEEPALIVE void mplay_extras_clear() {
++  memset(mplay_extras_obj, 0, sizeof(mplay_extras_obj));
++}
++
++}  // extern "C"
++
++// Second OBJ pass integration: see ppu-performance/object.cpp end-of-render
++// hook. (Patch lives in object.cpp; this file just provides the tables.)
+diff --git a/higan/target-web/mplay_extras.hpp b/higan/target-web/mplay_extras.hpp
+new file mode 100644
+--- /dev/null
++++ b/higan/target-web/mplay_extras.hpp
+@@ -0,0 +1,23 @@
++#pragma once
++#include <stdint.h>
++
++// Shadow table struct used by both mplay_extras.cpp and the PPU extras pass.
++struct MplayExtraObj {
++  int16_t  x, y;
++  uint16_t tile;
++  uint8_t  palette;
++  uint8_t  priority;
++  uint8_t  hflip, vflip;
++  uint8_t  width, height;
++};
++
++extern uint8_t      mplay_extras_vram[];
++extern uint8_t      mplay_extras_cgram[];
++extern MplayExtraObj mplay_extras_obj[];
++#ifdef __cplusplus
++extern "C" {
++#endif
++uint32_t mplay_extras_obj_count();
++#ifdef __cplusplus
++}
++#endif

@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>netro-emu</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #111; color: #eee; font-family: system-ui, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; gap: 1rem; }
+  h1 { font-size: 1.2rem; font-weight: 400; opacity: 0.7; }
+  canvas { image-rendering: pixelated; background: #000; border: 1px solid #333; }
+  .controls { display: flex; gap: 0.5rem; align-items: center; }
+  label { cursor: pointer; padding: 0.5rem 1rem; background: #222; border: 1px solid #444; border-radius: 4px; font-size: 0.85rem; }
+  label:hover { background: #333; }
+  input[type="file"] { display: none; }
+  #status { font-size: 0.8rem; opacity: 0.5; }
+  select { background: #222; color: #eee; border: 1px solid #444; padding: 0.4rem; border-radius: 4px; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+  <h1>netro-emu</h1>
+  <canvas id="screen" width="240" height="160"></canvas>
+  <div class="controls">
+    <select id="platform">
+      <option value="gba">GBA (mGBA)</option>
+      <option value="snes">SNES (bsnes)</option>
+    </select>
+    <label>Load ROM <input type="file" id="rom" accept=".gba,.gbc,.gb,.sfc,.smc,.nes"></label>
+  </div>
+  <div id="status">Drop a ROM file to play</div>
+  <script type="module">
+    const canvas = document.getElementById('screen');
+    const status = document.getElementById('status');
+    const platform = document.getElementById('platform');
+    const romInput = document.getElementById('rom');
+    let worker = null;
+
+    const KEY_MAP = {
+      ArrowUp: 'up', ArrowDown: 'down', ArrowLeft: 'left', ArrowRight: 'right',
+      z: 'a', x: 'b', a: 'l', s: 'r', Enter: 'start', Shift: 'select',
+    };
+
+    document.addEventListener('keydown', (e) => {
+      const btn = KEY_MAP[e.key];
+      if (btn && worker) { worker.postMessage({ type: 'button', port: 'Controller Port 1', btn, pressed: true }); e.preventDefault(); }
+    });
+    document.addEventListener('keyup', (e) => {
+      const btn = KEY_MAP[e.key];
+      if (btn && worker) { worker.postMessage({ type: 'button', port: 'Controller Port 1', btn, pressed: false }); e.preventDefault(); }
+    });
+
+    romInput.addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      const plat = platform.value;
+
+      if (worker) worker.terminate();
+      const workerUrl = plat === 'snes' ? 'snes_worker.js' : 'gba_worker.js';
+      worker = new Worker(workerUrl, { type: 'module' });
+
+      status.textContent = `Loading ${file.name}...`;
+
+      const offscreen = canvas.transferControlToOffscreen();
+      const audioSAB = new SharedArrayBuffer(16 + 8192 * 2);
+      new Int32Array(audioSAB, 0, 4).set([0, 0, 4096, 0]);
+
+      worker.postMessage({ type: 'init', offscreen, audioSAB }, [offscreen]);
+
+      worker.onmessage = (ev) => {
+        const msg = ev.data;
+        if (msg.type === 'ready') {
+          worker.postMessage({ type: 'loadRom', bytes, filename: file.name });
+        } else if (msg.type === 'loaded') {
+          if (msg.ok) {
+            status.textContent = `Playing — ${plat.toUpperCase()} — Z/X = A/B, arrows = dpad, enter = start`;
+            if (plat === 'snes') {
+              const tick = () => { worker.postMessage({ type: 'tick' }); requestAnimationFrame(tick); };
+              requestAnimationFrame(tick);
+            }
+            if (plat === 'gba') {
+              canvas.width = 240; canvas.height = 160;
+              canvas.style.width = '720px'; canvas.style.height = '480px';
+            } else {
+              canvas.width = 256; canvas.height = 224;
+              canvas.style.width = '768px'; canvas.style.height = '672px';
+            }
+          } else {
+            status.textContent = `Failed: ${msg.error}`;
+          }
+        } else if (msg.type === 'fps') {
+          // status.textContent = `${msg.fps} fps`;
+        } else if (msg.type === 'log') {
+          console.log(msg.msg);
+        }
+      };
+    });
+  </script>
+</body>
+</html>
